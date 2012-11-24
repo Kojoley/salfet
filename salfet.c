@@ -32,6 +32,7 @@
 #define AV_TIME_BASE_SEC    (AVRational){1, 1}
 
 struct PreProcessChanges {
+    enum PixelFormat format;
     int width, height;
 };
 
@@ -41,8 +42,8 @@ struct PreProcessSettings {
 
     int is_deinterlace;
 
-    int is_resize;
-    struct PreProcessChanges resize;
+    int is_resample;
+    struct PreProcessChanges resample;
 
     int is_crop;
     struct PreProcessChanges crop;
@@ -200,8 +201,8 @@ static AVFrame *aquire_frame(AVFormatContext *fmt_ctx, AVCodecContext *dec_ctx, 
         /* reading packets until we get one from stream of interestead */
         do {
             ret = av_read_frame(fmt_ctx, &pkt);
-            //if (pkt.stream_index == stream_idx)
-            //    av_log(NULL, AV_LOG_DEBUG, "pkt s:%d/%d size:%d pts:%"PRId64" dts:%"PRId64" goal:%"PRId64"\n", pkt.stream_index, stream_idx, pkt.size, pkt.pts, pkt.dts, ts);
+            if (pkt.stream_index == stream_idx)
+                av_dlog(NULL, "pkt s:%d/%d size:%d pts:%"PRId64" dts:%"PRId64" goal:%"PRId64"\n", pkt.stream_index, stream_idx, pkt.size, pkt.pts, pkt.dts, ts);
             if (ret < 0) {
                 if (ret == (int) AVERROR_EOF)
                     av_log(NULL, AV_LOG_DEBUG, "av_read_frame EOF\n");
@@ -219,7 +220,7 @@ static AVFrame *aquire_frame(AVFormatContext *fmt_ctx, AVCodecContext *dec_ctx, 
         } else if (!ret)
             av_log(NULL, AV_LOG_DEBUG, "No frame was decoded\n");
         else if (got_frame)
-            av_log(NULL, AV_LOG_DEBUG, "Got frame size:%d bet:%"PRId64"\n", ret, *best_effort_timestamp);
+            av_dlog(NULL, "Got frame size:%d bet:%"PRId64"\n", ret, *best_effort_timestamp);
     } while (!got_frame || *best_effort_timestamp < ts);
 
     av_free_packet(&pkt);
@@ -253,7 +254,7 @@ static int init_encoder_context(const char *filename, AVCodecContext *dec_ctx, A
     format_ctx->oformat = format;
 
     codec_id = av_guess_codec(format_ctx->oformat,
-                              NULL, format_ctx->filename,
+                              NULL, filename,
                               NULL, dec_ctx->codec_type);
     if (codec_id == CODEC_ID_NONE) {
         av_log(NULL, AV_LOG_FATAL, "Could not guess encoder\n");
@@ -274,6 +275,8 @@ static int init_encoder_context(const char *filename, AVCodecContext *dec_ctx, A
         goto end;
     }
 
+    av_log(NULL, AV_LOG_DEBUG, "output codect is %s\n", enc->name);
+
     enc_ctx->codec = enc;
 
     /* fill codec context info */
@@ -292,8 +295,6 @@ static int init_encoder_context(const char *filename, AVCodecContext *dec_ctx, A
 
     if (format_ctx->oformat->flags & AVFMT_GLOBALHEADER)
         enc_ctx->flags |= CODEC_FLAG_GLOBAL_HEADER;
-
-    av_log(NULL, AV_LOG_DEBUG, "output codect is %s\n", enc_ctx->codec->name);
 
     /* choose best pixel format from supported by codec */
     choose_pixel_fmt(enc_ctx, enc_ctx->codec);
@@ -318,6 +319,7 @@ static int encode_video_frame(AVFormatContext *format_ctx, AVCodecContext *enc_c
     AVStream *stream;
     int video_outbuf_size;
     uint8_t *video_outbuf;
+    AVCodecContext *ctx_tmp = NULL;
 
     stream = avformat_new_stream(format_ctx, NULL);
     if (!stream) {
@@ -325,8 +327,7 @@ static int encode_video_frame(AVFormatContext *format_ctx, AVCodecContext *enc_c
         goto end;
     }
 
-    //av_free(stream->codec);
-    AVCodecContext *ctx_tmp = stream->codec;
+    ctx_tmp = stream->codec;
     stream->codec = enc_ctx;
 
     ret = avformat_write_header(format_ctx, NULL);
@@ -340,6 +341,8 @@ static int encode_video_frame(AVFormatContext *format_ctx, AVCodecContext *enc_c
     /* create temporary picture */
     video_outbuf_size = avpicture_get_size(enc_ctx->pix_fmt,
                                            enc_ctx->width, enc_ctx->height);
+    /* FIXME: avpicture_get_size for BMP returns insufficient size */
+    video_outbuf_size += strcmp(enc_ctx->codec->name, "bmp") ? 0 : 54;
     video_outbuf = av_malloc(video_outbuf_size);
     if (!video_outbuf) {
         ret = AVERROR(ENOMEM);
@@ -383,43 +386,43 @@ free_pkt:
     av_free(video_outbuf);
 
 end:
-    stream->codec = ctx_tmp;
+    if (ctx_tmp)
+        stream->codec = ctx_tmp;
 
     return ret;
 }
 
-int resize_frame(AVFrame *src_frame, int width, int height)
+int resample_frame(AVFrame *frame, struct PreProcessChanges *dst)
 {
+    int ret;
     static struct SwsContext *sws_ctx = NULL;
     AVPicture pic;
-    int ret;
-
-    if (width < 1 && height < 1)
-        return -1;
-    else if (height < 1)
-        height = (double) src_frame->height / src_frame->width * width;
-    else if (width < 1)
-        width = (double) src_frame->width / src_frame->height * height;
+    uint8_t *buf;
 
     sws_ctx = sws_getCachedContext(sws_ctx,
-                                   src_frame->width, src_frame->height,
-                                   src_frame->format,
-                                   width, height, src_frame->format,
+                                   frame->width, frame->height, frame->format,
+                                   dst->width, dst->height, dst->format,
                                    SWS_BICUBIC, NULL, NULL, NULL);
     if (sws_ctx == NULL)
         return -1;
 
-    avpicture_fill(&pic, *src_frame->data, src_frame->format, width, height);
+    buf = av_malloc(avpicture_get_size(dst->format, dst->width, dst->height));
+    if (!buf)
+        return AVERROR(ENOMEM);
 
-    ret = sws_scale(sws_ctx, (const uint8_t * const*)
-                    src_frame->data, src_frame->linesize,
-                    0, src_frame->height, src_frame->data, pic.linesize);
+    avpicture_fill(&pic, buf, dst->format, dst->width, dst->height);
 
-    for (int i = 0; i < AV_NUM_DATA_POINTERS; ++i)
-        src_frame->linesize[i] = pic.linesize[i];
+    ret = sws_scale(sws_ctx, (const uint8_t * const*) frame->data,
+                    frame->linesize, 0, frame->height, pic.data, pic.linesize);
 
-    src_frame->width = width;
-    src_frame->height = height;
+    for (int i = 0; i < AV_NUM_DATA_POINTERS; ++i) {
+        frame->data[i] = pic.data[i];
+        frame->linesize[i] = pic.linesize[i];
+    }
+
+    frame->format = dst->format;
+    frame->width  = dst->width;
+    frame->height = dst->height;
 
     return ret;
 }
@@ -433,13 +436,12 @@ static void pre_process_init(AVDictionary *options, struct PreProcessSettings *p
      * use avcodec_align_dimensions2
      */
 
-    ppvfs->result = ppvfs->source;
-
     /* deinterlace */
     ppvfs->is_deinterlace = !!av_dict_get_fcval(options, "deinterlace");
 
     /* crop */
     ppvfs->is_crop = 0;
+    ppvfs->crop = ppvfs->result;
     tmp = av_dict_get_fcval(options, "crop");
     if (tmp) {
         if (atoi(tmp) > 0) {
@@ -454,10 +456,12 @@ static void pre_process_init(AVDictionary *options, struct PreProcessSettings *p
     }
 
     /* resize */
-    ppvfs->is_resize = 0;
+    ppvfs->is_resample = 0;
+    ppvfs->is_resample = ppvfs->result.format != ppvfs->source.format;
+    ppvfs->resample = ppvfs->result;
     if (av_dict_get_fval(options, "resize_", AV_DICT_IGNORE_SUFFIX)) {
-        int *width  = &ppvfs->resize.width;
-        int *height = &ppvfs->resize.height;
+        int *width  = &ppvfs->resample.width;
+        int *height = &ppvfs->resample.height;
         tmp = av_dict_get_fcval(options, "resize_width");
         *width = tmp ? atoi(tmp) : -1;
         tmp = av_dict_get_fcval(options, "resize_height");
@@ -474,8 +478,8 @@ static void pre_process_init(AVDictionary *options, struct PreProcessSettings *p
                 *width = (double) ppvfs->result.width
                                  / ppvfs->result.height * *height;
 
-            ppvfs->result = ppvfs->resize;
-            ppvfs->is_resize = 1;
+            ppvfs->result = ppvfs->resample;
+            ppvfs->is_resample = 1;
         }
     }
 }
@@ -503,12 +507,12 @@ static int pre_process_video_frame(struct PreProcessSettings *ppvfs, AVFrame *fr
     }
 
     /* resize */
-    if (ppvfs->is_resize) {
-        int width  = ppvfs->resize.width;
-        int height = ppvfs->resize.height;
-
-        if (width > 0 || height > 0)
-            resize_frame(frame, width, height);
+    if (ppvfs->is_resample) {
+        /* HACK: because of deinterlace implementation */
+        uint8_t *tmp = frame->data[0];
+        resample_frame(frame, &ppvfs->resample);
+        if (ppvfs->is_deinterlace)
+            av_free(tmp);
     }
 
     return ret;
@@ -569,8 +573,10 @@ static inline int process_video(AVDictionary *options)
     }
 
     /* calculate preprocess values for opening codec with right values */
-    ppvfs.source.width  = dec_ctx->width;
-    ppvfs.source.height = dec_ctx->height;
+    ppvfs.source.format = dec_ctx->pix_fmt;
+    ppvfs.result.format = enc_ctx->pix_fmt;
+    ppvfs.result.width  = ppvfs.source.width  = dec_ctx->width;
+    ppvfs.result.height = ppvfs.source.height = dec_ctx->height;
     pre_process_init(options, &ppvfs);
     enc_ctx->width  = ppvfs.result.width;
     enc_ctx->height = ppvfs.result.height;
@@ -617,6 +623,8 @@ static inline int process_video(AVDictionary *options)
         if (frame) {
             /* preprocess video: deinterlace, crop, pad, resize and etc. */
             ret = pre_process_video_frame(&ppvfs, frame);
+            if (ret)
+                goto free_frame;
 
             /* expand template and set output filename  */
             snprintf(out_fmt_ctx->filename, sizeof(out_fmt_ctx->filename),
@@ -624,11 +632,13 @@ static inline int process_video(AVDictionary *options)
 
             /* encode frame */
             ret = encode_video_frame(out_fmt_ctx, enc_ctx, frame);
+            if (ret)
+                goto free_frame;
 
-            /* HACK: Hack in deinterlace implementation */
-            if (av_dict_get_fcval(options, "deinterlace"))
+            /* HACK: free buffer because of deinterlace or resample */
+            if (ppvfs.is_deinterlace || ppvfs.is_resample)
                 av_free(frame->data[0]);
-
+free_frame:
             av_free(frame);
         } else
             av_log(NULL, AV_LOG_ERROR, "Frame decoding was failed\n");
