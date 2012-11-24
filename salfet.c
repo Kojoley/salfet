@@ -24,6 +24,7 @@
 #include <libavutil/imgutils.h>
 #include <libavutil/avstring.h>
 #include <libswscale/swscale.h>
+#include <libavutil/opt.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <getopt.h>
@@ -179,6 +180,7 @@ static AVFrame *aquire_frame(AVFormatContext *fmt_ctx, AVCodecContext *dec_ctx, 
     int ret, got_frame;
     AVFrame *frame;
     AVPacket pkt;
+    int64_t *best_effort_timestamp;
 
     /* initialize packet */
     av_init_packet(&pkt);
@@ -190,13 +192,16 @@ static AVFrame *aquire_frame(AVFormatContext *fmt_ctx, AVCodecContext *dec_ctx, 
         return NULL;
     }
 
+    /* get pointer to best_effort_timestamp variable in AVFrame object */
+    best_effort_timestamp = av_opt_ptr(avcodec_get_frame_class(), frame, "best_effort_timestamp");
+
     /* call av_read_frame until we got whole frame */
     do {
         /* reading packets until we get one from stream of interestead */
         do {
             ret = av_read_frame(fmt_ctx, &pkt);
             //if (pkt.stream_index == stream_idx)
-            //    av_log(NULL, AV_LOG_DEBUG, "s:%d/%d size:%d pts:%"PRId64"/%"PRId64"\n", pkt.stream_index, stream_idx, pkt.size, pkt.pts, ts);
+            //    av_log(NULL, AV_LOG_DEBUG, "pkt s:%d/%d size:%d pts:%"PRId64" dts:%"PRId64" goal:%"PRId64"\n", pkt.stream_index, stream_idx, pkt.size, pkt.pts, pkt.dts, ts);
             if (ret < 0) {
                 if (ret == (int) AVERROR_EOF)
                     av_log(NULL, AV_LOG_DEBUG, "av_read_frame EOF\n");
@@ -206,18 +211,16 @@ static AVFrame *aquire_frame(AVFormatContext *fmt_ctx, AVCodecContext *dec_ctx, 
 
         /* decode video packet to frame */
         ret = avcodec_decode_video2(dec_ctx, frame, &got_frame, &pkt);
-        if (ret <= 0) {
-            if (ret)
-                av_log(NULL, AV_LOG_FATAL, "Error decoding video frame\n");
-            else
-                av_log(NULL, AV_LOG_DEBUG, "No frame was decoded\n");
+        if (ret < 0) {
+            av_log(NULL, AV_LOG_FATAL, "Error decoding video frame\n");
             av_free(frame);
             av_free_packet(&pkt);
             return NULL;
-        }
+        } else if (!ret)
+            av_log(NULL, AV_LOG_DEBUG, "No frame was decoded\n");
         else if (got_frame)
-            av_log(NULL, AV_LOG_DEBUG, "Got frame, size %d bytes\n", ret);
-    } while (!got_frame || pkt.pts < ts);
+            av_log(NULL, AV_LOG_DEBUG, "Got frame size:%d bet:%"PRId64"\n", ret, *best_effort_timestamp);
+    } while (!got_frame || *best_effort_timestamp < ts);
 
     av_free_packet(&pkt);
 
@@ -519,6 +522,10 @@ static inline int process_video(AVDictionary *options)
     AVCodecContext *dec_ctx = NULL;
     AVStream *stream = NULL;
     int stream_idx = -1;
+    AVFormatContext *out_fmt_ctx = NULL;
+    AVCodecContext *enc_ctx = NULL;
+    struct PreProcessSettings ppvfs;
+    AVDictionaryEntry *e = NULL;
 
     /* register all formats and codecs */
     av_register_all();
@@ -556,15 +563,12 @@ static inline int process_video(AVDictionary *options)
         goto end;
 
     /* init encoder context */
-    AVFormatContext *out_fmt_ctx = NULL;
-    AVCodecContext *enc_ctx = NULL;
     init_encoder_context(out_template, dec_ctx, &out_fmt_ctx, &enc_ctx);
     if (!out_fmt_ctx || !enc_ctx) {
         goto end;
     }
 
     /* calculate preprocess values for opening codec with right values */
-    struct PreProcessSettings ppvfs;
     ppvfs.source.width  = dec_ctx->width;
     ppvfs.source.height = dec_ctx->height;
     pre_process_init(options, &ppvfs);
@@ -579,16 +583,18 @@ static inline int process_video(AVDictionary *options)
     }
 
     /* iterate process procedure on every timestamp */
-    AVDictionaryEntry *e = NULL;
     while ((e = av_dict_get(options, "timestamp_", e, AV_DICT_IGNORE_SUFFIX))) {
         int64_t sec = atol(e->value), ts = sec;
-        char *dst_filename = av_asprintf(out_template, ts);
         AVFrame *frame;
 
         /* calc frame from seconds */
         //ts = av_rescale_q(ts, AV_TIME_BASE_Q, stream->time_base);
         /* FIXME: check twice why we cant use AV_TIME_BASE_Q */
         ts = av_rescale_q(ts, AV_TIME_BASE_SEC, stream->time_base);
+        if (ts > stream->duration) {
+            av_log(NULL, AV_LOG_WARNING, "Timestamp %s is out of duration\n", e->value);
+            continue;
+        }
 
         /* add stream start offset if present */
         if (stream->start_time != (int64_t) AV_NOPTS_VALUE)
@@ -608,15 +614,13 @@ static inline int process_video(AVDictionary *options)
 
         /* aquire frame from input at given timestamp */
         frame = aquire_frame(fmt_ctx, dec_ctx, stream_idx, ts);
-        if (!frame) {
-            av_log(NULL, AV_LOG_ERROR, "Frame decoding was failed\n");
-        } else {
+        if (frame) {
             /* preprocess video: deinterlace, crop, pad, resize and etc. */
             ret = pre_process_video_frame(&ppvfs, frame);
 
-            /* set output filename */
-            av_strlcpy(out_fmt_ctx->filename, dst_filename,
-                       sizeof(out_fmt_ctx->filename));
+            /* expand template and set output filename  */
+            snprintf(out_fmt_ctx->filename, sizeof(out_fmt_ctx->filename),
+                     out_template, sec);
 
             /* encode frame */
             ret = encode_video_frame(out_fmt_ctx, enc_ctx, frame);
@@ -626,10 +630,8 @@ static inline int process_video(AVDictionary *options)
                 av_free(frame->data[0]);
 
             av_free(frame);
-        }
-
-        /* free string allocated by expanding template */
-        av_free(dst_filename);
+        } else
+            av_log(NULL, AV_LOG_ERROR, "Frame decoding was failed\n");
     }
 end:
     if (out_fmt_ctx)
