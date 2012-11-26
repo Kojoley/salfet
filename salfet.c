@@ -89,7 +89,7 @@ static int open_codec_context(int *stream_idx,
         if (!dec) {
             av_log(NULL, AV_LOG_FATAL, "Failed to find %s codec %s\n",
                    av_get_media_type_string(type), dec->name);
-            return 1;
+            return AVERROR_DECODER_NOT_FOUND;
         }
 
         /* open codec */
@@ -230,7 +230,6 @@ static AVFrame *aquire_frame(AVFormatContext *fmt_ctx, AVCodecContext *dec_ctx, 
 
 static int init_encoder_context(const char *filename, AVCodecContext *dec_ctx, AVFormatContext **format_ctx_ptr, AVCodecContext **enc_ctx_ptr)
 {
-    int ret = 0;
     AVOutputFormat *format;
     AVFormatContext *format_ctx;
     enum CodecID codec_id;
@@ -247,37 +246,35 @@ static int init_encoder_context(const char *filename, AVCodecContext *dec_ctx, A
 
     format_ctx = avformat_alloc_context();
     if (!format_ctx) {
-        ret = AVERROR(ENOMEM);
-        goto end;
+        return AVERROR(ENOMEM);
     }
 
     format_ctx->oformat = format;
+    *format_ctx_ptr = format_ctx;
 
     codec_id = av_guess_codec(format_ctx->oformat,
                               NULL, filename,
                               NULL, dec_ctx->codec_type);
     if (codec_id == CODEC_ID_NONE) {
         av_log(NULL, AV_LOG_FATAL, "Could not guess encoder\n");
-        ret = AVERROR_ENCODER_NOT_FOUND;
-        goto end;
+        return AVERROR_ENCODER_NOT_FOUND;
     }
 
     enc = avcodec_find_encoder(codec_id);
     if (!enc) {
         av_log(NULL, AV_LOG_FATAL, "Could not found encoder\n");
-        ret = AVERROR_ENCODER_NOT_FOUND;
-        goto end;
+        return AVERROR_ENCODER_NOT_FOUND;
     }
 
     enc_ctx = avcodec_alloc_context3(enc);
     if (!enc_ctx) {
-        ret = AVERROR(ENOMEM);
-        goto end;
+        return AVERROR(ENOMEM);
     }
 
     av_log(NULL, AV_LOG_DEBUG, "output codect is %s\n", enc->name);
 
     enc_ctx->codec = enc;
+    *enc_ctx_ptr = enc_ctx;
 
     /* fill codec context info */
     enc_ctx->time_base  = dec_ctx->time_base;
@@ -302,15 +299,10 @@ static int init_encoder_context(const char *filename, AVCodecContext *dec_ctx, A
     if (enc_ctx->pix_fmt == PIX_FMT_NONE) {
         av_log(NULL, AV_LOG_FATAL, "Video pixel format is unknown,"
                                    " stream cannot be encoded\n");
-        ret = AVERROR(EPIPE);
-        goto end;
+        return AVERROR(EPIPE);
     }
 
-    *enc_ctx_ptr = enc_ctx;
-    *format_ctx_ptr = format_ctx;
-
-end:
-    return ret;
+    return 0;
 }
 
 static int encode_video_frame(AVFormatContext *format_ctx, AVCodecContext *enc_ctx, AVFrame *frame)
@@ -331,9 +323,9 @@ static int encode_video_frame(AVFormatContext *format_ctx, AVCodecContext *enc_c
     stream->codec = enc_ctx;
 
     ret = avformat_write_header(format_ctx, NULL);
-    if (ret != 0) {
+    if (ret < 0) {
         char buf[64];
-        av_strerror(ret, (char *)&buf, 64);
+        av_strerror(ret, buf, 64);
         av_log(NULL, AV_LOG_FATAL, "Failed to write header %s\n", buf);
         goto end;
     }
@@ -363,15 +355,16 @@ static int encode_video_frame(AVFormatContext *format_ctx, AVCodecContext *enc_c
         pkt.size = ret;
 
         /* write the compressed frame in the media file */
-        if (av_interleaved_write_frame(format_ctx, &pkt) != 0)
-        {
+        ret = av_interleaved_write_frame(format_ctx, &pkt);
+        if (ret < 0) {
             av_log(NULL, AV_LOG_ERROR, "Can't write a frame\n");
             goto free_pkt;
         }
 
         ret = av_write_trailer(format_ctx);
-        if (ret != 0) {
+        if (ret < 0) {
             av_log(NULL, AV_LOG_FATAL, "Failed to write trailer\n");
+            goto free_pkt;
         }
 
         av_log(NULL, AV_LOG_DEBUG, "Sucess at encoding frame to %s\n",
@@ -403,8 +396,14 @@ int resample_frame(AVFrame *frame, struct PreProcessChanges *dst)
                                    frame->width, frame->height, frame->format,
                                    dst->width, dst->height, dst->format,
                                    SWS_BICUBIC, NULL, NULL, NULL);
-    if (sws_ctx == NULL)
-        return -1;
+    if (!sws_ctx) {
+        av_log(NULL, AV_LOG_FATAL,
+               "Impossible to create scale context for the conversion "
+               "fmt:%s s:%dx%d -> fmt:%s s:%dx%d\n",
+               av_get_pix_fmt_name(frame->format), frame->width, frame->height,
+               av_get_pix_fmt_name(dst->format), dst->width, dst->height);
+        return AVERROR(EINVAL);
+    }
 
     buf = av_malloc(avpicture_get_size(dst->format, dst->width, dst->height));
     if (!buf)
@@ -456,7 +455,6 @@ static void pre_process_init(AVDictionary *options, struct PreProcessSettings *p
     }
 
     /* resize */
-    ppvfs->is_resample = 0;
     ppvfs->is_resample = ppvfs->result.format != ppvfs->source.format;
     ppvfs->resample = ppvfs->result;
     if (av_dict_get_fval(options, "resize_", AV_DICT_IGNORE_SUFFIX)) {
@@ -510,8 +508,8 @@ static int pre_process_video_frame(struct PreProcessSettings *ppvfs, AVFrame *fr
     if (ppvfs->is_resample) {
         /* HACK: because of deinterlace implementation */
         uint8_t *tmp = frame->data[0];
-        resample_frame(frame, &ppvfs->resample);
-        if (ppvfs->is_deinterlace)
+        ret = resample_frame(frame, &ppvfs->resample);
+        if (ret > 0 && ppvfs->is_deinterlace)
             av_free(tmp);
     }
 
@@ -623,7 +621,7 @@ static inline int process_video(AVDictionary *options)
         if (frame) {
             /* preprocess video: deinterlace, crop, pad, resize and etc. */
             ret = pre_process_video_frame(&ppvfs, frame);
-            if (ret)
+            if (ret < 0)
                 goto free_frame;
 
             /* expand template and set output filename  */
@@ -632,7 +630,7 @@ static inline int process_video(AVDictionary *options)
 
             /* encode frame */
             ret = encode_video_frame(out_fmt_ctx, enc_ctx, frame);
-            if (ret)
+            if (ret < 0)
                 goto free_frame;
 
             /* HACK: free buffer because of deinterlace or resample */
@@ -694,7 +692,7 @@ int main(int argc, char **argv)
     };
 
     while ((c = getopt_long(argc, argv, short_options,
-        long_options, &option_index)) != -1) {
+                            long_options, &option_index)) != -1) {
         switch (c) {
         case '?':
             usage(argv[0]);
@@ -748,13 +746,13 @@ int main(int argc, char **argv)
     if (argc - optind) {
         for (int i = 0; argc > optind; ++optind) {
             char buf[64];
-            sprintf(buf, "%ld", atol(argv[optind]));
+            snprintf(buf, sizeof(buf), "%ld", atol(argv[optind]));
             if (strcmp(argv[optind], buf) != 0) {
                 av_log(NULL, AV_LOG_WARNING, "wrong timestamp %s\n", argv[optind]);
                 continue;
             }
-            sprintf(buf, "timestamp_%d", i++);
-            av_dict_set(&options, (char *)&buf, argv[optind], 0);
+            snprintf(buf, sizeof(buf), "timestamp_%d", i++);
+            av_dict_set(&options, buf, argv[optind], 0);
         }
     } else {
         av_log(NULL, AV_LOG_FATAL, "at least one timestamp must be specified\n");
