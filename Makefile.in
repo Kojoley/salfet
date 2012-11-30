@@ -1,0 +1,22 @@
+PROG=@PACKAGE_NAME@
+SRCS=$(PROG).c
+
+CC=@CC@
+
+CFLAGS+=-std=c99 @CFLAGS@ @FFMPEG_CFLAGS@
+LDFLAGS+=@LDFLAGS@ @FFMPEG_LIBS@ @LIBS@
+
+OBJS=$(SRCS:.c=.o)
+
+$(PROG): $(OBJS)
+	$(CC) $< $(LDFLAGS) -o $@
+
+%.o: %.c
+	$(CC) $< $(CFLAGS) -c -o $@
+
+.PHONY: all clean
+
+all: $(PROG)
+
+clean:
+	rm -rf $(PROG) $(OBJS)

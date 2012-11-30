@@ -18,3 +18,9 @@
 
 # User data
 *.pro.user
+
+# Configs
+aclocal.m4
+config.*
+configure
+Makefile
