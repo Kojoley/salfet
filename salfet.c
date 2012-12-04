@@ -334,6 +334,7 @@ static int encode_video_frame(AVFormatContext *format_ctx, AVCodecContext *enc_c
     video_outbuf_size = avpicture_get_size(enc_ctx->pix_fmt,
                                            enc_ctx->width, enc_ctx->height);
     /* FIXME: avpicture_get_size for BMP returns insufficient size */
+    /* 54 == sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER) */
     video_outbuf_size += strcmp(enc_ctx->codec->name, "bmp") ? 0 : 54;
     video_outbuf = av_malloc(video_outbuf_size);
     if (!video_outbuf) {
