@@ -9,6 +9,7 @@ FILE=autogen.sh
 DIE=0
 
 ACLOCAL=aclocal
+AUTOHEADER=autoheader
 AUTOCONF=autoconf
 PKGCONFIG=pkg-config
 
@@ -16,6 +17,14 @@ PKGCONFIG=pkg-config
         echo "You must have $ACLOCAL installed to compile $PROJECT."
         echo "Download the appropriate package for your distribution,"
         echo "or get the source tarball at http://ftp.gnu.org/gnu/automake/"
+        echo
+        DIE=1
+}
+
+($AUTOHEADER --version) < /dev/null > /dev/null 2>&1 || {
+        echo "You must have $AUTOHEADER installed to compile $PROJECT."
+        echo "Download the appropriate package for your distribution,"
+        echo "or get the source tarball at http://ftp.gnu.org/gnu/autoconf/"
         echo
         DIE=1
 }
@@ -53,6 +62,7 @@ if test -z "$*"; then
 fi
 
 $ACLOCAL || echo "$ACLOCAL failed"
+$AUTOHEADER || echo "$AUTOHEADER failed"
 $AUTOCONF || echo "$AUTOCONF failed"
 
 run_configure=true

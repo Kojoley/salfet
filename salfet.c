@@ -20,13 +20,17 @@
  * THE SOFTWARE.
  */
 
+#if HAVE_CONFIG_H
+#  include <config.h>
+#endif
+#if HAVE_INTTYPES_H
+#  include <inttypes.h>
+#endif
 #include <libavformat/avformat.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/avstring.h>
 #include <libswscale/swscale.h>
 #include <libavutil/opt.h>
-#include <inttypes.h>
-#include <stdio.h>
 #include <getopt.h>
 
 #define AV_TIME_BASE_SEC    (AVRational){1, 1}
